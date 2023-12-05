@@ -17,7 +17,7 @@ from . import jaxagent
 from . import jaxutils
 from . import nets
 from . import ninjax as nj
-
+import numpy as np
 
 @jaxagent.Wrapper
 class Agent(nj.Module):
@@ -318,35 +318,53 @@ class ImagActorCritic(nj.Module):
 
 class VFunction(nj.Module):
 
-  def __init__(self, rewfn, config):
+  def __init__(self, rewfn, config, numQ=2):
     self.rewfn = rewfn
     self.config = config
-    self.net = nets.MLP((), name='net', dims='deter', **self.config.critic)
-    self.slow = nets.MLP((), name='slow', dims='deter', **self.config.critic)
-    self.updater = jaxutils.SlowUpdater(
-        self.net, self.slow,
-        self.config.slow_critic_fraction,
-        self.config.slow_critic_update)
+    self.numQ = numQ
+    self.net = []
+    self.slow = []
+    self.updater = []
+    for i in range(self.numQ):
+      self.net.append(nets.MLP((), name='net'+i, dims='deter', **self.config.critic))
+      self.slow.append(nets.MLP((), name='slow'+i, dims='deter', **self.config.critic))
+      self.updater.append(jaxutils.SlowUpdater(
+          self.net[i], self.slow[i],
+          self.config.slow_critic_fraction,
+          self.config.slow_critic_update))
     self.opt = jaxutils.Optimizer(name='critic_opt', **self.config.critic_opt)
 
   def train(self, traj, actor):
-    target = sg(self.score(traj)[1])
-    mets, metrics = self.opt(self.net, self.loss, traj, target, has_aux=True)
-    metrics.update(mets)
-    self.updater()
-    return metrics
+    metrics = []
+    values = []
+    for i in range(self.numQ):
+      target = sg(self.score(traj)[1])
+      met, metric = self.opt(self.net[i], self.loss, traj, target, i, has_aux=True)
 
-  def loss(self, traj, target):
+      metric.update(met)
+      metrics.append(metric)
+      
+      self.updater[i]()
+
+      values.append(self.net[i](traj).mean())
+
+    proxy = np.argmin(values)
+    self.proxy_net = self.net[proxy]
+    self.proxy_slow = self.slow[proxy]
+    
+    return metrics[proxy]
+
+  def loss(self, traj, target, i):
     metrics = {}
     traj = {k: v[:-1] for k, v in traj.items()}
-    dist = self.net(traj)
+    dist = self.net[i](traj)
     loss = -dist.log_prob(sg(target))
     if self.config.critic_slowreg == 'logprob':
-      reg = -dist.log_prob(sg(self.slow(traj).mean()))
+      reg = -dist.log_prob(sg(self.slow[i](traj).mean()))
     elif self.config.critic_slowreg == 'xent':
       reg = -jnp.einsum(
           '...i,...i->...',
-          sg(self.slow(traj).probs),
+          sg(self.slow[i](traj).probs),
           jnp.log(dist.probs))
     else:
       raise NotImplementedError(self.config.critic_slowreg)
@@ -362,7 +380,7 @@ class VFunction(nj.Module):
         'should provide rewards for all but last action')
     discount = 1 - 1 / self.config.horizon
     disc = traj['cont'][1:] * discount
-    value = self.net(traj).mean()
+    value = self.proxy_net(traj).mean()
     vals = [value[-1]]
     interm = rew + disc * value[1:] * (1 - self.config.return_lambda)
     for t in reversed(range(len(disc))):
