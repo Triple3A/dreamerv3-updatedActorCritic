@@ -318,16 +318,17 @@ class ImagActorCritic(nj.Module):
 
 class VFunction(nj.Module):
 
-  def __init__(self, rewfn, config, numQ=2):
+  def __init__(self, rewfn, config, numQ=10, m=4):
     self.rewfn = rewfn
     self.config = config
     self.numQ = numQ
+    self.m = m
     self.net = []
     self.slow = []
     self.updater = []
     for i in range(self.numQ):
-      self.net.append(nets.MLP((), name='net'+i, dims='deter', **self.config.critic))
-      self.slow.append(nets.MLP((), name='slow'+i, dims='deter', **self.config.critic))
+      self.net.append(nets.MLP((), name='net' + str(i), dims='deter', **self.config.critic))
+      self.slow.append(nets.MLP((), name='slow' + str(i), dims='deter', **self.config.critic))
       self.updater.append(jaxutils.SlowUpdater(
           self.net[i], self.slow[i],
           self.config.slow_critic_fraction,
@@ -348,11 +349,12 @@ class VFunction(nj.Module):
 
       values.append(self.net[i](traj).mean())
 
-    proxy = np.argmin(values)
-    self.proxy_net = self.net[proxy]
-    self.proxy_slow = self.slow[proxy]
+    sample_idxs = np.rabdom.choice(self.numQ, self.m, replace=False)
+    proxy_idx = sample_idxs[np.argmin([values[i] for i in sample_idxs])]
+    self.proxy_net = self.net[proxy_idx]
+    self.proxy_slow = self.slow[proxy_idx]
     
-    return metrics[proxy]
+    return metrics[proxy_idx]
 
   def loss(self, traj, target, i):
     metrics = {}
