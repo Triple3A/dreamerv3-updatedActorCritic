@@ -1,5 +1,6 @@
 import embodied
 import jax
+from jax import device_get
 import jax.numpy as jnp
 import ruamel.yaml as yaml
 tree_map = jax.tree_util.tree_map
@@ -18,6 +19,9 @@ from . import jaxutils
 from . import nets
 from . import ninjax as nj
 import numpy as np
+
+from functools import partial
+from jax import jit
 
 @jaxagent.Wrapper
 class Agent(nj.Module):
@@ -262,7 +266,7 @@ class ImagActorCritic(nj.Module):
   def policy(self, state, carry):
     return {'action': self.actor(state)}, carry
 
-  def train(self, imagine, start, context):
+  def train(self, imagine, start, context, m=4):
     def loss(start):
       policy = lambda s: self.actor(sg(s)).sample(seed=nj.rng())
       traj = imagine(policy, start, self.config.imag_horizon)
@@ -270,7 +274,10 @@ class ImagActorCritic(nj.Module):
       return loss, (traj, metrics)
     mets, (traj, metrics) = self.opt(self.actor, loss, start, has_aux=True)
     metrics.update(mets)
+    # numQ = len(self.critics)
+    # sample_idxs = np.random.choice(numQ, m, replace=False)
     for key, critic in self.critics.items():
+      # print("Key:", key)
       mets = critic.train(traj, self.actor)
       metrics.update({f'{key}_critic_{k}': v for k, v in mets.items()})
     return traj, metrics
@@ -318,55 +325,35 @@ class ImagActorCritic(nj.Module):
 
 class VFunction(nj.Module):
 
-  def __init__(self, rewfn, config, numQ=10, m=4):
+  def __init__(self, rewfn, config):
     self.rewfn = rewfn
     self.config = config
-    self.numQ = numQ
-    self.m = m
-    self.net = []
-    self.slow = []
-    self.updater = []
-    for i in range(self.numQ):
-      self.net.append(nets.MLP((), name='net' + str(i), dims='deter', **self.config.critic))
-      self.slow.append(nets.MLP((), name='slow' + str(i), dims='deter', **self.config.critic))
-      self.updater.append(jaxutils.SlowUpdater(
-          self.net[i], self.slow[i],
-          self.config.slow_critic_fraction,
-          self.config.slow_critic_update))
+    self.net = nets.MLP((), name='net', dims='deter', **self.config.critic)
+    self.slow = nets.MLP((), name='slow', dims='deter', **self.config.critic)
+    self.updater = jaxutils.SlowUpdater(
+        self.net, self.slow,
+        self.config.slow_critic_fraction,
+        self.config.slow_critic_update)
     self.opt = jaxutils.Optimizer(name='critic_opt', **self.config.critic_opt)
 
   def train(self, traj, actor):
-    metrics = []
-    values = []
-    for i in range(self.numQ):
-      target = sg(self.score(traj)[1])
-      met, metric = self.opt(self.net[i], self.loss, traj, target, i, has_aux=True)
+    target = sg(self.score(traj)[1])
+    mets, metrics = self.opt(self.net, self.loss, traj, target, has_aux=True)
+    metrics.update(mets)
+    self.updater()
+    return metrics
 
-      metric.update(met)
-      metrics.append(metric)
-      
-      self.updater[i]()
-
-      values.append(self.net[i](traj).mean())
-
-    sample_idxs = np.rabdom.choice(self.numQ, self.m, replace=False)
-    proxy_idx = sample_idxs[np.argmin([values[i] for i in sample_idxs])]
-    self.proxy_net = self.net[proxy_idx]
-    self.proxy_slow = self.slow[proxy_idx]
-    
-    return metrics[proxy_idx]
-
-  def loss(self, traj, target, i):
+  def loss(self, traj, target):
     metrics = {}
     traj = {k: v[:-1] for k, v in traj.items()}
-    dist = self.net[i](traj)
+    dist = self.net(traj)
     loss = -dist.log_prob(sg(target))
     if self.config.critic_slowreg == 'logprob':
-      reg = -dist.log_prob(sg(self.slow[i](traj).mean()))
+      reg = -dist.log_prob(sg(self.slow(traj).mean()))
     elif self.config.critic_slowreg == 'xent':
       reg = -jnp.einsum(
           '...i,...i->...',
-          sg(self.slow[i](traj).probs),
+          sg(self.slow(traj).probs),
           jnp.log(dist.probs))
     else:
       raise NotImplementedError(self.config.critic_slowreg)
@@ -382,10 +369,108 @@ class VFunction(nj.Module):
         'should provide rewards for all but last action')
     discount = 1 - 1 / self.config.horizon
     disc = traj['cont'][1:] * discount
-    value = self.proxy_net(traj).mean()
+    value = self.net(traj).mean()
     vals = [value[-1]]
     interm = rew + disc * value[1:] * (1 - self.config.return_lambda)
     for t in reversed(range(len(disc))):
       vals.append(interm[t] + disc[t] * self.config.return_lambda * vals[-1])
     ret = jnp.stack(list(reversed(vals))[:-1])
     return rew, ret, value[:-1]
+
+  # def __init__(self, rewfn, config, numQ=10, m=4):
+  #   # print('------------------------------------------')
+  #   self.rewfn = rewfn
+  #   self.config = config
+  #   self.numQ = numQ
+  #   self.m = m
+  #   self.net = []
+  #   self.slow = []
+  #   self.updater = []
+  #   self.opt = []
+  #   self.proxy_net = nets.MLP((), name='proxy_net', dims='deter', **self.config.critic)
+  #   self.proxy_slow = nets.MLP((), name='proxy_slow', dims='deter', **self.config.critic)
+  #   self.min_value = None
+  #   for i in range(self.numQ):
+  #     self.net.append(nets.MLP((), name='net' + str(i + 1), dims='deter', **self.config.critic))
+  #     self.slow.append(nets.MLP((), name='slow' + str(i + 1), dims='deter', **self.config.critic))
+  #     self.updater.append(jaxutils.SlowUpdater(
+  #         self.net[i], self.slow[i],
+  #         self.config.slow_critic_fraction,
+  #         self.config.slow_critic_update))
+  #     self.opt.append(jaxutils.Optimizer(name='critic_opt' + str(i + 1), **self.config.critic_opt))
+
+
+  # def train(self, traj, actor):
+  #   print("______________________________________________")
+  #   metrics = []
+  #   values = []
+  #   # print("traj", traj)
+  #   sample_idxs = np.random.choice(self.numQ, self.m, replace=False)
+
+  #   for i in range(self.numQ):
+  #     target = sg(self.score(traj)[1])
+  #     met, metric = self.opt[i](self.net[i], self.loss, traj, target, i, has_aux=True)
+
+  #     metric.update(met)
+  #     metrics.append(metric)
+      
+  #     self.updater[i]()
+
+
+  #     if i in sample_idxs:
+  #       value = self.net[i](traj).mean()
+  #       values.append(value)
+  #       # print(value)
+
+  #   # print(metrics)
+  #   values = jnp.array(values)
+  #   self.min_value = jnp.min(values, axis=0)
+  #   print("Value: ", self.min_value)
+  #   # proxy_idx = jnp.argmin(values)
+  #   # print("Index", proxy_idx)
+  #   # self.proxy_net = self.net[proxy_idx]
+  #   # self.proxy_slow = self.slow[proxy_idx]
+    
+  #   return metrics[0]
+
+  # def loss(self, traj, target, i):
+  #   metrics = {}
+  #   traj = {k: v[:-1] for k, v in traj.items()}
+  #   dist = self.net[i](traj)
+  #   loss = -dist.log_prob(sg(target))
+  #   if self.config.critic_slowreg == 'logprob':
+  #     reg = -dist.log_prob(sg(self.slow[i](traj).mean()))
+  #   elif self.config.critic_slowreg == 'xent':
+  #     reg = -jnp.einsum(
+  #         '...i,...i->...',
+  #         sg(self.slow[i](traj).probs),
+  #         jnp.log(dist.probs))
+  #   else:
+  #     raise NotImplementedError(self.config.critic_slowreg)
+  #   loss += self.config.loss_scales.slowreg * reg
+  #   loss = (loss * sg(traj['weight'])).mean()
+  #   loss *= self.config.loss_scales.critic
+  #   metrics = jaxutils.tensorstats(dist.mean())
+  #   # print('\ndist:', dist, '\ntarget:', target, '\nloss:', loss)
+  #   # jax.debug.print("loss: {}", loss)
+  #   return loss, metrics
+
+  # def score(self, traj, actor=None):
+  #   rew = self.rewfn(traj)
+  #   assert len(rew) == len(traj['action']) - 1, (
+  #       'should provide rewards for all but last action')
+  #   discount = 1 - 1 / self.config.horizon
+  #   disc = traj['cont'][1:] * discount
+  #   if self.min_value is None:
+  #     value = self.proxy_net(traj).mean()
+  #   else:
+  #     value = self.min_value
+  #   # print("Shape:" ,value.shape)
+  #   vals = [value[-1]]
+  #   interm = rew + disc * value[1:] * (1 - self.config.return_lambda)
+  #   for t in reversed(range(len(disc))):
+  #     vals.append(interm[t] + disc[t] * self.config.return_lambda * vals[-1])
+  #   ret = jnp.stack(list(reversed(vals))[:-1])
+  #   # print('\nreward:', rew, '\nreturn:', ret, '\nvalue:', value)
+  #   # print(value[:-1])
+  #   return rew, ret, value[:-1]

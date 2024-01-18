@@ -13,11 +13,38 @@ class Greedy(nj.Module):
   def __init__(self, wm, act_space, config):
     rewfn = lambda s: wm.heads['reward'](s).mean()[1:]
     if config.critic_type == 'vfunction':
-      critics = {'extr': agent.VFunction(rewfn, config, name='critic')}
+      critics = {
+        '1': agent.VFunction(rewfn, config, name='critic_1'),
+        '2': agent.VFunction(rewfn, config, name='critic_2'),
+        '3': agent.VFunction(rewfn, config, name='critic_3'),
+        '4': agent.VFunction(rewfn, config, name='critic_4'),
+        '5': agent.VFunction(rewfn, config, name='critic_5'),
+        '6': agent.VFunction(rewfn, config, name='critic_6'),
+        '7': agent.VFunction(rewfn, config, name='critic_7'),
+        '8': agent.VFunction(rewfn, config, name='critic_8'),
+        '9': agent.VFunction(rewfn, config, name='critic_9'),
+        '10': agent.VFunction(rewfn, config, name='critic_10')
+      }
+      # critics = {'extr': agent.VFunction(rewfn, config, name='critic')}
     else:
       raise NotImplementedError(config.critic_type)
+
+    scale = {
+      '1': 0.1,
+      '2': 0.1,
+      '3': 0.1,
+      '4': 0.1,
+      '5': 0.1,
+      '6': 0.1,
+      '7': 0.1,
+      '8': 0.1,
+      '9': 0.1,
+      '10': 0.1
+    }
     self.ac = agent.ImagActorCritic(
-        critics, {'extr': 1.0}, act_space, config, name='ac')
+        critics, scale, act_space, config, name='ac')
+    # self.ac = agent.ImagActorCritic(
+        # critics, {'extr': 1.0}, act_space, config, name='ac')
 
   def initial(self, batch_size):
     return self.ac.initial(batch_size)
