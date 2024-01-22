@@ -296,7 +296,8 @@ class ImagActorCritic(nj.Module):
       metrics.update(jaxutils.tensorstats(ret, f'{key}_return_raw'))
       metrics.update(jaxutils.tensorstats(normed_ret, f'{key}_return_normed'))
       metrics[f'{key}_return_rate'] = (jnp.abs(ret) >= 0.5).mean()
-    adv = jnp.stack(advs).sum(0)
+    adv = jnp.stack(advs).min(0)
+    # print(adv)
     policy = self.actor(sg(traj))
     logpi = policy.log_prob(sg(traj['action']))[:-1]
     loss = {'backprop': -adv, 'reinforce': -logpi * sg(adv)}[self.grad]
